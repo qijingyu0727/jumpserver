@@ -2,6 +2,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import shutil
 import time
 from collections import defaultdict
@@ -25,6 +26,14 @@ from ops.ansible.interface import interface
 from users.utils import activate_user_language
 
 logger = get_logger(__name__)
+
+BULK_SIZE = 80
+RUNTIME_DIR_UNSAFE_CHARS = re.compile(r'[\s/\\:<>|"?*\x00-\x1f]+')
+
+
+def safe_runtime_dir_name(name):
+    dir_name = RUNTIME_DIR_UNSAFE_CHARS.sub('_', str(name or '')).strip('_')
+    return dir_name or 'automation'
 
 
 class SSHTunnelManager:
@@ -189,7 +198,7 @@ class BaseManager:
 
 
 class PlaybookPrepareMixin:
-    bulk_size = 100
+    bulk_size = BULK_SIZE
     ansible_account_policy = "privileged_first"
     ansible_account_prefer = "root,Administrator"
 
@@ -237,7 +246,7 @@ class PlaybookPrepareMixin:
     def prepare_runtime_dir(self):
         ansible_dir = settings.ANSIBLE_DIR
         task_name = self.execution.snapshot["name"]
-        dir_name = "{}_{}".format(task_name.replace(" ", "_"), self.execution.id)
+        dir_name = "{}_{}".format(safe_runtime_dir_name(task_name), self.execution.id)
         path = os.path.join(
             ansible_dir,
             "automations",
@@ -259,6 +268,7 @@ class PlaybookPrepareMixin:
     def write_cert_to_file(filename, content):
         with open(filename, "w") as f:
             f.write(content)
+        os.chmod(filename, 0o600)
         return filename
 
     def convert_cert_to_file(self, host, path_dir):
@@ -376,7 +386,7 @@ class PlaybookPrepareMixin:
 
 
 class BasePlaybookManager(PlaybookPrepareMixin, BaseManager):
-    bulk_size = 100
+    bulk_size = BULK_SIZE
     ansible_account_policy = "privileged_first"
     ansible_account_prefer = ""
 
