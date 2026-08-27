@@ -2,48 +2,12 @@
 #
 from collections import defaultdict
 
-from django.db.models import F
+from django.db.models import Count, F, Q
 
 from common.struct import Stack
-from common.utils import get_logger, dict_get_any, is_uuid, get_object_or_none, timeit
+from common.utils import dict_get_any, is_uuid, get_object_or_none, timeit
 from common.utils.http import is_true
-from orgs.utils import ensure_in_real_or_default_org, current_org
-from ..locks import NodeTreeUpdateLock
-from ..models import Node, Asset
-
-logger = get_logger(__file__)
-
-
-@NodeTreeUpdateLock()
-@ensure_in_real_or_default_org
-def check_node_assets_amount():
-    logger.info(f'Check node assets amount {current_org}')
-    m2m_model = Asset.nodes.through
-    nodes = list(Node.objects.all().only('id', 'key', 'assets_amount'))
-    nodeid_assetid_pairs = list(m2m_model.objects.all().values_list('node_id', 'asset_id'))
-
-    nodekey_assetids_mapper = defaultdict(set)
-    nodeid_nodekey_mapper = {}
-    for node in nodes:
-        nodeid_nodekey_mapper[node.id] = node.key
-
-    for node_id, asset_id in nodeid_assetid_pairs:
-        if node_id not in nodeid_nodekey_mapper:
-            continue
-        node_key = nodeid_nodekey_mapper[node_id]
-        nodekey_assetids_mapper[node_key].add(asset_id)
-
-    util = NodeAssetsUtil(nodes, nodekey_assetids_mapper)
-    util.generate()
-
-    to_updates = []
-    for node in nodes:
-        assets_amount = util.get_assets_amount(node.key)
-        if node.assets_amount != assets_amount:
-            logger.error(f'Node[{node.key}] assets amount error {node.assets_amount} != {assets_amount}')
-            node.assets_amount = assets_amount
-            to_updates.append(node)
-    Node.objects.bulk_update(to_updates, fields=('assets_amount',))
+from ..models import Node
 
 
 def is_query_node_all_assets(request):
@@ -65,6 +29,94 @@ def get_node_from_request(request):
     else:
         node = get_object_or_none(Node, key=node_id)
     return node
+
+
+def _count_assets_by_target_key(relations, target_keys):
+    """Count distinct assets for target node subtrees in one relation pass."""
+    assets_by_key = defaultdict(set)
+    matches_by_node_key = {}
+
+    for asset_id, node_key in relations:
+        matched_keys = matches_by_node_key.get(node_key)
+        if matched_keys is None:
+            matched_keys = []
+            key = node_key
+            while key:
+                if key in target_keys:
+                    matched_keys.append(key)
+                key = key.rpartition(':')[0]
+            matches_by_node_key[node_key] = matched_keys
+
+        for key in matched_keys:
+            assets_by_key[key].add(asset_id)
+
+    return {
+        key: len(assets_by_key[key])
+        for key in target_keys
+    }
+
+
+def get_nodes_realtime_assets_amount(nodes, include_descendants=True):
+    """Return exact asset amounts for a bounded node collection.
+
+    Descendant counts intentionally avoid a correlated subquery per node.
+    Relevant M2M rows are read once per organization, then distinct assets are
+    accumulated along the materialized node path. All query expressions used
+    here are portable across PostgreSQL, MySQL and MariaDB.
+    """
+    from assets.models import Asset
+
+    nodes = list(nodes)
+    amounts = {node.id: 0 for node in nodes}
+    if not nodes:
+        return amounts
+
+    relations = Asset.nodes.through.objects.order_by()
+    if not include_descendants:
+        rows = (
+            relations.filter(node_id__in=amounts)
+            .values('node_id')
+            .annotate(amount=Count('asset_id', distinct=True))
+        )
+        amounts.update({row['node_id']: row['amount'] for row in rows})
+        return amounts
+
+    nodes_by_org = defaultdict(list)
+    for node in nodes:
+        nodes_by_org[node.org_id].append(node)
+
+    for org_id, org_nodes in nodes_by_org.items():
+        nodes_by_key = {node.key: node for node in org_nodes}
+        target_keys = set(nodes_by_key)
+        descendant_filter = Q()
+        for root_key in Node.clean_children_keys(target_keys):
+            descendant_filter |= (
+                Q(node__key=root_key) |
+                Q(node__key__startswith=f'{root_key}:')
+            )
+
+        org_relations = (
+            relations.filter(node__org_id=org_id)
+            .filter(descendant_filter)
+            .values_list('asset_id', 'node__key')
+        )
+        amounts_by_key = _count_assets_by_target_key(
+            org_relations.iterator(chunk_size=10000), target_keys
+        )
+        for key, node in nodes_by_key.items():
+            amounts[node.id] = amounts_by_key[key]
+
+    return amounts
+
+
+def attach_nodes_realtime_assets_amount(nodes, include_descendants=True):
+    nodes = list(nodes)
+    amounts = get_nodes_realtime_assets_amount(
+        nodes, include_descendants=include_descendants
+    )
+    for node in nodes:
+        node.assets_amount_realtime = amounts[node.id]
+    return nodes
 
 
 class NodeAssetsInfo:

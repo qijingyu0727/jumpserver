@@ -11,20 +11,22 @@ from common.tree import TreeNodeSerializer
 from common.utils import get_logger
 from orgs.mixins import generics
 from orgs.utils import current_org
-from .mixin import SerializeToTreeNodeMixin
+from .mixin import NodeAssetsAmountListMixin, SerializeToTreeNodeMixin
 from .. import serializers
 from ..const import AllTypes
 from ..models import Node, Platform, Asset
+from ..utils import attach_nodes_realtime_assets_amount
 
 logger = get_logger(__file__)
 __all__ = [
     'NodeChildrenApi',
     'NodeChildrenAsTreeApi',
+    'NodeAssetsAmountApi',
     'CategoryTreeApi',
 ]
 
 
-class NodeChildrenApi(generics.ListCreateAPIView):
+class NodeChildrenApi(NodeAssetsAmountListMixin, generics.ListCreateAPIView):
     """
     节点的增删改查
     """
@@ -77,7 +79,7 @@ class NodeChildrenApi(generics.ListCreateAPIView):
         else:
             return Node.org_root_nodes()
 
-    def get_queryset(self):
+    def get_base_queryset(self):
         query_all = self.request.query_params.get("all", "0") == "all"
 
         if self.is_initial and current_org.is_root():
@@ -96,6 +98,9 @@ class NodeChildrenApi(generics.ListCreateAPIView):
         else:
             queryset = self.instance.get_children(with_self=with_self)
         return queryset
+
+    def get_queryset(self):
+        return self.get_base_queryset()
 
 
 class NodeChildrenAsTreeApi(SerializeToTreeNodeMixin, NodeChildrenApi):
@@ -145,14 +150,73 @@ class NodeChildrenAsTreeApi(SerializeToTreeNodeMixin, NodeChildrenApi):
         return assets
 
     def list(self, request, *args, **kwargs):
-        nodes = self.filter_queryset(self.get_queryset()).order_by('value')
+        include_assets = request.query_params.get('assets', '0') == '1'
         with_asset_amount = request.query_params.get('asset_amount', '1') == '1'
+        query_all = request.query_params.get('all', '0') == 'all'
+        compact = request.query_params.get('compact', '0') == '1'
+
+        nodes = self.filter_queryset(self.get_base_queryset())
+        nodes = nodes.order_by('value')
+
+        if compact and query_all and not include_assets and not with_asset_amount:
+            rows = nodes.values_list('id', 'key', 'value', 'parent_key')
+            return Response(data=self.serialize_compact_nodes(rows))
+
+        nodes = nodes.only(
+            'id', 'key', 'value', 'parent_key', 'org_id', 'assets_amount'
+        )
+
+        if query_all and not include_assets:
+            # The complete response already contains every descendant. Derive
+            # leaf state in linear time and avoid one EXISTS subquery per node.
+            nodes = list(nodes)
+            parent_keys = {node.parent_key for node in nodes if node.parent_key}
+            for node in nodes:
+                node.has_children = node.key in parent_keys
+        else:
+            nodes = list(nodes.with_has_children(include_assets=include_assets))
+
+        if with_asset_amount:
+            nodes = attach_nodes_realtime_assets_amount(nodes)
+
         nodes = self.serialize_nodes(nodes, with_asset_amount=with_asset_amount)
         assets = self.filter_queryset_for_assets(self.get_queryset_for_assets())
         node_key = self.instance.key if self.instance else None
         assets = self.serialize_assets(assets, node_key=node_key)
         data = [*nodes, *assets]
         return Response(data=data)
+
+
+class NodeAssetsAmountApi(generics.CreateAPIView):
+    """Return exact direct or subtree asset counts for a bounded node batch."""
+
+    serializer_class = serializers.NodeAssetsAmountQuerySerializer
+    rbac_perms = {
+        'POST': 'assets.view_node',
+    }
+
+    def create(self, request, *args, **kwargs):
+        serializer = self.get_serializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        node_ids = serializer.validated_data['node_ids']
+        include_descendants = serializer.validated_data['include_descendants']
+
+        nodes = attach_nodes_realtime_assets_amount(
+            Node.objects.filter(id__in=node_ids).only('id', 'key', 'org_id'),
+            include_descendants=include_descendants,
+        )
+        nodes_by_id = {str(node.id): node for node in nodes}
+        results = []
+        for node_id in node_ids:
+            node = nodes_by_id.get(str(node_id))
+            if not node:
+                continue
+            results.append({
+                'id': str(node.id),
+                'key': node.key,
+                'assets_amount': node.assets_amount_realtime,
+            })
+        return Response({'results': results})
 
 
 class CategoryTreeApi(SerializeToTreeNodeMixin, generics.ListAPIView):

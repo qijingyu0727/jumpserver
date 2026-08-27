@@ -12,7 +12,6 @@ from rest_framework.utils.encoders import JSONEncoder
 from common.db.models import JMSBaseModel
 from common.db.utils import Encryptor
 from common.utils import get_logger
-from .const import ChatAITypeChoices
 from .signals import setting_changed
 
 
@@ -197,20 +196,41 @@ class ChatPrompt(JMSBaseModel):
         return self.name
 
 
-def get_chatai_data():
+def get_chat_ai_config():
     data = {
-        'url': settings.GPT_BASE_URL,
-        'api_key': settings.GPT_API_KEY,
-        'proxy': settings.GPT_PROXY,
-        'model': settings.GPT_MODEL if settings.GPT_MODEL != 'custom' else settings.CUSTOM_GPT_MODEL,
+        'base_url': settings.CHAT_AI_BASE_URL or '',
+        'api_key': settings.CHAT_AI_API_KEY or '',
+        'proxy': settings.CHAT_AI_PROXY or '',
+        'model': settings.CHAT_AI_MODEL or '',
     }
-    if settings.CHAT_AI_TYPE != ChatAITypeChoices.gpt:
-        data['url'] = settings.DEEPSEEK_BASE_URL
-        data['api_key'] = settings.DEEPSEEK_API_KEY
-        data['proxy'] = settings.DEEPSEEK_PROXY
-        data['model'] = settings.DEEPSEEK_MODEL if settings.DEEPSEEK_MODEL != 'custom' else settings.CUSTOM_DEEPSEEK_MODEL
+    if data['api_key'] and data['model']:
+        return data
 
-    return data
+    chat_type = getattr(settings, 'CHAT_AI_TYPE', '') or 'gpt'
+    if chat_type == 'deep-seek':
+        legacy_model = getattr(settings, 'DEEPSEEK_MODEL', '') or ''
+        custom_model = getattr(settings, 'CUSTOM_DEEPSEEK_MODEL', '') or ''
+        legacy = {
+            'base_url': getattr(settings, 'DEEPSEEK_BASE_URL', '') or '',
+            'api_key': getattr(settings, 'DEEPSEEK_API_KEY', '') or '',
+            'proxy': getattr(settings, 'DEEPSEEK_PROXY', '') or '',
+            'model': custom_model if legacy_model == 'custom' else legacy_model,
+        }
+    else:
+        legacy_model = getattr(settings, 'GPT_MODEL', '') or ''
+        custom_model = getattr(settings, 'CUSTOM_GPT_MODEL', '') or ''
+        legacy = {
+            'base_url': getattr(settings, 'GPT_BASE_URL', '') or '',
+            'api_key': getattr(settings, 'GPT_API_KEY', '') or '',
+            'proxy': getattr(settings, 'GPT_PROXY', '') or '',
+            'model': custom_model if legacy_model == 'custom' else legacy_model,
+        }
+    return {
+        'base_url': data['base_url'] or legacy['base_url'],
+        'api_key': data['api_key'] or legacy['api_key'],
+        'proxy': data['proxy'] or legacy['proxy'],
+        'model': data['model'] or legacy['model'],
+    }
 
 
 class LeakPasswords(models.Model):
