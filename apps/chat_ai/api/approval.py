@@ -15,7 +15,7 @@ from chat_ai.approvals import ApprovalService
 from chat_ai.executor.core_client import CoreAPIExecutor
 from chat_ai.models import Approval
 from chat_ai.openapi import OpenAPILoader
-from chat_ai.permissions import ChatAIOrgPermission, ChatAIServicePermission
+from chat_ai.permissions import CanUseChatAI, ChatAIOrgPermission, ChatAIServicePermission
 from chat_ai.policies import PolicyEngine
 
 from .serializers import ApprovalSerializer, OpenAPIRegistrySerializer
@@ -29,7 +29,9 @@ class CoreExecutionError(APIException):
 
 class ApprovalViewSet(mixins.RetrieveModelMixin, JMSGenericViewSet):
     serializer_class = ApprovalSerializer
-    permission_classes = (ChatAIServicePermission, IsValidUser, ChatAIOrgPermission)
+    permission_classes = (
+        ChatAIServicePermission, IsValidUser, ChatAIOrgPermission, CanUseChatAI,
+    )
     http_method_names = ('get', 'post', 'head', 'options')
 
     def get_queryset(self):
@@ -43,7 +45,7 @@ class ApprovalViewSet(mixins.RetrieveModelMixin, JMSGenericViewSet):
         self.get_object()
         loader = OpenAPILoader()
         registry = async_to_sync(loader.load)()
-        policy = PolicyEngine()
+        policy = PolicyEngine(user=request.user)
         service = ApprovalService(registry, policy)
         approval, _ = service.prepare_confirmation(pk, request.user, current_org.id)
         auth_context = RequestAuthContext.from_request(request, current_org.id)
