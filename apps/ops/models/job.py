@@ -1,11 +1,12 @@
 import json
 import logging
 import os
+import shlex
 import sys
 import uuid
 from collections import defaultdict
 from datetime import timedelta, datetime
-from functools import partial
+from functools import cached_property, partial
 
 from celery import current_task
 from django.conf import settings
@@ -26,6 +27,7 @@ from assets.automations.base.manager import SSHTunnelManager
 from common.db.encoder import ModelJSONFieldEncoder
 from ops.ansible import (
     JMSInventory, AdHocRunner, PlaybookRunner, TaskLogCallback, UploadFileRunner,
+    neutralize_jinja2_syntax,
 )
 
 """stop all ssh child processes of the given ansible process pid."""
@@ -163,7 +165,7 @@ class JMSPermedInventory(JMSInventory):
             for my_asset in node_asset_map[node_key]:
                 asset_permed_accounts_mapper[my_asset].update(accounts)
 
-        accounts = Account.objects.filter(asset__in=asset_ids)
+        accounts = Account.objects.filter(asset__in=asset_ids, is_active=True)
         for account in accounts:
             if account.asset_id not in asset_permed_accounts_mapper:
                 continue
@@ -183,7 +185,7 @@ class JobHistoricalRecords(HistoricalRecords):
 class Job(JMSOrgBaseModel, PeriodTaskModelMixin):
     name = models.CharField(max_length=128, null=True, verbose_name=_('Name'))
     instant = models.BooleanField(default=False)
-    args = models.CharField(max_length=8192, default='', verbose_name=_('Args'), null=True, blank=True)
+    args = models.TextField(max_length=65536, default='', verbose_name=_('Args'), null=True, blank=True)
     module = models.CharField(max_length=128, choices=JobModules.choices, default=JobModules.shell,
                               verbose_name=_('Module'), null=True)
     chdir = models.CharField(default="", max_length=1024, verbose_name=_('Run dir'), null=True, blank=True)
@@ -281,7 +283,7 @@ class JobExecution(JMSOrgBaseModel):
     date_start = models.DateTimeField(null=True, verbose_name=_('Date start'), db_index=True)
     date_finished = models.DateTimeField(null=True, verbose_name=_("Date finished"))
 
-    material = models.CharField(max_length=8192, default='', verbose_name=_('Material'), null=True, blank=True)
+    material = models.TextField(default='', verbose_name=_('Material'), null=True, blank=True)
     job_type = models.CharField(max_length=128, choices=Types.choices, default=Types.adhoc,
                                 verbose_name=_("Material Type"))
 
@@ -301,11 +303,16 @@ class JobExecution(JMSOrgBaseModel):
             return self.job.get_history(self.job_version)
         return self.job
 
+    @cached_property
+    def inventory(self):
+        return self.current_job.inventory
+
     def compile_shell(self):
         if self.current_job.type != 'adhoc':
             return
 
         module = self.current_job.module
+        args = neutralize_jinja2_syntax(self.current_job.args or '')
 
         db_modules = ('mysql', 'postgresql', 'sqlserver', 'oracle')
         db_module_name_map = {
@@ -336,7 +343,7 @@ class JobExecution(JMSOrgBaseModel):
             if module == 'mssql_script':
                 login_args += "encryption={{jms_asset.encryption | default(None) }} " \
                               "tds_version={{jms_asset.tds_version | default(None) }} "
-            shell = "{} {}=\"{}\" ".format(login_args, query_token, self.current_job.args)
+            shell = "{} {}=\"{}\" ".format(login_args, query_token, args)
             return module, shell
 
         if module == 'win_shell':
@@ -345,21 +352,23 @@ class JobExecution(JMSOrgBaseModel):
         if self.current_job.module in ['python']:
             module = "shell"
 
-        shell = self.current_job.args
+        shell = args
         if self.current_job.chdir:
             if module == "shell":
-                shell += " chdir={}".format(self.current_job.chdir)
+                shell += " chdir={}".format(
+                    shlex.quote(neutralize_jinja2_syntax(self.current_job.chdir))
+                )
         if self.current_job.module in ['python']:
             shell += " executable={}".format(self.current_job.module)
 
         if module == JobModules.huawei.value:
             module = 'ce_command'
-            shell = "commands=\"{}\" ".format(self.current_job.args)
+            shell = "commands=\"{}\" ".format(args)
 
         return module, shell
 
     def get_runner(self):
-        inv = self.current_job.inventory
+        inv = self.inventory
         inv.write_to_file(self.inventory_path)
         self.summary = self.result = {"excludes": {}}
         if len(inv.exclude_hosts) > 0:
@@ -489,7 +498,7 @@ class JobExecution(JMSOrgBaseModel):
                     print("\033[31mcommand \'{}\' on asset {}({}) is rejected by acl {}\033[0m"
                           .format(self.current_job.args, asset.name, asset.address, acl))
                     CommandExecutionAlert({
-                        "assets": self.current_job.assets.all(),
+                        "assets": self.inventory.assets,
                         "input": self.material,
                         "risk_level": RiskLevelChoices.reject,
                         "user": self.creator,
@@ -515,7 +524,7 @@ class JobExecution(JMSOrgBaseModel):
         return False
 
     def check_command_acl(self):
-        for asset in self.current_job.assets.all():
+        for asset in self.inventory.assets:
             acls = CommandFilterACL.filter_queryset(
                 user=self.creator,
                 asset=asset,
@@ -527,7 +536,7 @@ class JobExecution(JMSOrgBaseModel):
         command = self.current_job.args
         if command and set(command.split()).intersection(set(settings.SECURITY_COMMAND_BLACKLIST)):
             CommandExecutionAlert({
-                "assets": self.current_job.assets.all(),
+                "assets": self.inventory.assets,
                 "input": self.material,
                 "risk_level": RiskLevelChoices.reject,
                 "user": self.creator,
@@ -544,11 +553,12 @@ class JobExecution(JMSOrgBaseModel):
             raise Exception("Playbook contains dangerous keywords")
 
     def check_assets_perms(self):
+        assets = self.inventory.assets
         all_permed_assets = UserPermAssetUtil(self.creator).get_all_assets()
-        has_permed_assets = set(self.current_job.assets.all()) & set(all_permed_assets)
+        has_permed_assets = set(assets) & set(all_permed_assets)
 
         error_assets_count = 0
-        for asset in self.current_job.assets.all():
+        for asset in assets:
             if asset not in has_permed_assets:
                 print("\033[31mAsset {}({}) has no access permission\033[0m".format(asset.name, asset.address))
                 error_assets_count += 1
@@ -557,7 +567,7 @@ class JobExecution(JMSOrgBaseModel):
             raise Exception("You do not have access rights to {} assets".format(error_assets_count))
 
     def check_data_masking_rules_acls(self):
-        for asset in self.current_job.assets.all():
+        for asset in self.inventory.assets:
             acls = DataMaskingRule.filter_queryset(
                 user=self.creator,
                 asset=asset,

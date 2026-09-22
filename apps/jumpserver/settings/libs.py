@@ -84,6 +84,7 @@ SPECTACULAR_SETTINGS = {
     # 添加自定义字段扩展
     'SERIALIZER_EXTENSIONS': [
         'jumpserver.views.schema.ObjectRelatedFieldExtension',
+        'jumpserver.views.schema.JSONManyToManyFieldExtension',
         'jumpserver.views.schema.LabeledChoiceFieldExtension',
         'jumpserver.views.schema.BitChoicesFieldExtension',
         'jumpserver.views.schema.LabelRelatedFieldExtension',
@@ -247,12 +248,12 @@ JUMPSERVER_UPTIME = int(time.time())
 
 # OAuth2 Provider settings
 OAUTH2_PROVIDER = {
-    'ALLOWED_REDIRECT_URI_SCHEMES': ['https', 'jms'],
+    'ALLOWED_REDIRECT_URI_SCHEMES': ['https', 'jms2'],
     'PKCE_REQUIRED': True,
     'ACCESS_TOKEN_EXPIRE_SECONDS': CONFIG.OAUTH2_PROVIDER_ACCESS_TOKEN_EXPIRE_SECONDS,
     'REFRESH_TOKEN_EXPIRE_SECONDS': CONFIG.OAUTH2_PROVIDER_REFRESH_TOKEN_EXPIRE_SECONDS,
 }
-OAUTH2_PROVIDER_CLIENT_REDIRECT_URI = 'jms://auth/callback'
+OAUTH2_PROVIDER_CLIENT_REDIRECT_URI = 'jms2://auth/callback'
 OAUTH2_PROVIDER_JUMPSERVER_CLIENT_NAME = 'JumpServer Client'
 
 if CONFIG.DEBUG_DEV:

@@ -15,11 +15,13 @@ class WebMethod(TextChoices):
     web_gui = 'web_gui', 'Web GUI'
     web_cli = 'web_cli', 'Web CLI'
     web_sftp = 'web_sftp', 'Web SFTP'
+    web_proxy = 'web_proxy', 'Built-in Browser'
 
     @classmethod
     def get_spec_methods(cls):
         methods = {
-            Protocol.sftp: [cls.web_sftp]
+            Protocol.sftp: [cls.web_sftp],
+            Protocol.http: [cls.web_proxy],
         }
         return methods
 
@@ -58,6 +60,7 @@ class NativeClient(TextChoices):
             clients.update({
                 Protocol.mongodb: [cls.db_client, cls.db_guide],
                 Protocol.oracle: [cls.db_client, cls.db_guide],
+                Protocol.dameng: [cls.db_client, cls.db_guide],
             })
         return clients
 
@@ -112,7 +115,8 @@ class AppletMethod:
         if not has_applet_hosts:
             return methods
         applets = Applet.objects.filter(is_active=True)
-        for applet in applets:
+        # Prefer WebLite without excluding other explicitly installed browsers.
+        for applet in sorted(applets, key=lambda applet: applet.name != 'weblite'):
             for protocol in applet.protocols:
                 methods[protocol].append({
                     'value': applet.name,
@@ -157,10 +161,11 @@ class ConnectMethodUtil:
                     Protocol.ssh, Protocol.telnet, Protocol.sftp,
                     Protocol.redis, Protocol.mongodb,
                     Protocol.k8s, Protocol.clickhouse,
+                    Protocol.http,
 
                     Protocol.mysql, Protocol.mariadb,
                     Protocol.sqlserver, Protocol.postgresql,
-                    Protocol.oracle
+                    Protocol.oracle, Protocol.dameng,
                 ],
                 # 限制客户端的协议，比如 koko 虽然也支持 数据库的 ssh 连接，但是不再这里拉起
                 # Listen协议: [Asset协议]
@@ -177,7 +182,7 @@ class ConnectMethodUtil:
                     Protocol.mysql, Protocol.postgresql,
                     Protocol.oracle, Protocol.sqlserver,
                     Protocol.mariadb, Protocol.db2,
-                    Protocol.dameng
+                    Protocol.dameng, Protocol.clickhouse
                 ],
                 'match': 'm2m'
             },
@@ -194,7 +199,7 @@ class ConnectMethodUtil:
                     Protocol.mysql, Protocol.postgresql,
                     Protocol.oracle, Protocol.mariadb,
                     Protocol.redis, Protocol.sqlserver,
-                    Protocol.mongodb
+                    Protocol.mongodb, Protocol.dameng,
                 ],
                 'match': 'map'
             },
