@@ -31,6 +31,7 @@ from accounts.personal_credentials import (
     validate_personal_credential_secret_type,
 )
 from accounts.utils import validate_account_username, validate_ssh_key
+from acls.models import ConnectMethodACL
 from acls.notifications import AssetLoginReminderMsg
 from assets.const import Protocol
 from assets.models import Asset
@@ -759,21 +760,19 @@ class ConnectionTokenViewSet(AuthFaceMixin, ExtraActionApiMixin, RootOrgViewMixi
                 'Personal credentials can only be managed by their owner'
             ))
 
-        if account_name != AliasAccount.INPUT and (credential_id or save_credential):
-            raise ValidationError({
-                'personal_credential_id': _(
-                    'Personal credentials can only be used with the manual account'
-                )
-            })
+        if credential_id or save_credential:
+            personal_permission_context = get_personal_credential_permission_context(
+                user, asset, protocol, account_alias=account_name,
+            )
+            if save_credential and account_name != AliasAccount.INPUT:
+                # A hosted account fixes the username, regardless of client input.
+                data['input_username'] = personal_permission_context[1].full_username
 
         if save_credential and not data.get('input_username'):
             raise ValidationError({'input_username': _('This field is required.')})
         if save_credential and not data.get('input_secret'):
             raise ValidationError({'input_secret': _('This field is required.')})
         if save_credential:
-            personal_permission_context = get_personal_credential_permission_context(
-                user, asset, protocol
-            )
             platform_protocol, __ = personal_permission_context
             input_secret_type = (
                 data.get('input_secret_type') or SecretType.PASSWORD
@@ -808,11 +807,6 @@ class ConnectionTokenViewSet(AuthFaceMixin, ExtraActionApiMixin, RootOrgViewMixi
                         'Do not submit a username or secret when using a saved credential'
                     )
                 })
-            personal_permission_context = (
-                get_personal_credential_permission_context(
-                    user, asset, protocol
-                )
-            )
             credential = get_personal_credential_for_use(
                 user, asset, protocol, credential_id,
                 version=credential_version,
@@ -850,7 +844,11 @@ class ConnectionTokenViewSet(AuthFaceMixin, ExtraActionApiMixin, RootOrgViewMixi
                 user=user,
                 asset=asset,
                 protocol=protocol,
-                username=data.get('input_username', ''),
+                username=(
+                    personal_permission_account.full_username
+                    if account_name != AliasAccount.INPUT
+                    else data.get('input_username', '')
+                ),
                 secret=data.get('input_secret', ''),
                 secret_type=data.get('input_secret_type') or SecretType.PASSWORD,
                 credential_id=credential_id,
@@ -902,6 +900,11 @@ class ConnectionTokenViewSet(AuthFaceMixin, ExtraActionApiMixin, RootOrgViewMixi
             self, user, asset, account_alias, protocol, connect_method,
             permed_account=None,
     ):
+        if not ConnectMethodACL.is_method_allowed(user, asset, connect_method, protocol):
+            raise JMSException(
+                code='connect_method_rejected',
+                detail=_('Connect method is not allowed for this asset')
+            )
         data = dict()
         data['org_id'] = asset.org_id
         data['user'] = user
@@ -921,7 +924,8 @@ class ConnectionTokenViewSet(AuthFaceMixin, ExtraActionApiMixin, RootOrgViewMixi
 
         if account_alias != AliasAccount.INPUT and account_alias != AliasAccount.USER:
             data['input_username'] = ''
-            data['input_secret_type'] = ''
+            if account.has_secret:
+                data['input_secret_type'] = ''
 
         ticket = self._validate_acl(user, asset, account, connect_method, protocol)
         if ticket:
@@ -983,12 +987,18 @@ class ConnectionTokenViewSet(AuthFaceMixin, ExtraActionApiMixin, RootOrgViewMixi
             msg = _('ACL action is reject: {}({})'.format(acl.name, acl.id))
             raise JMSException(code='acl_reject', detail=msg)
         if acl.is_action(acl.ActionChoices.review):
+            account_username = (
+                self.input_username if account.username == AliasAccount.INPUT else account.username
+            )
+            if acl.is_review_exempt(user, asset, account_username):
+                self._record_operate_log(acl, asset)
+                return
             if not self.request.query_params.get('create_ticket'):
                 msg = _('ACL action is review')
                 raise JMSException(code='acl_review', detail=msg)
             self._record_operate_log(acl, asset)
-            ticket = LoginAssetACL.create_login_asset_review_ticket(
-                user=user, asset=asset, account_username=self.input_username,
+            ticket = acl.create_login_asset_review_ticket(
+                user=user, asset=asset, account_username=account_username,
                 assignees=acl.reviewers.all(), org_id=asset.org_id
             )
             return ticket
@@ -1187,9 +1197,10 @@ class SuperConnectionTokenViewSet(ConnectionTokenViewSet):
             "expired": instance.is_expired
         }
         try:
-            if instance.personal_credential_id:
-                instance.is_valid()
-            else:
+            # Components check established sessions after the one-time token
+            # has been consumed. Revalidate access without reviving that token.
+            instance.is_valid(check_expiration=False)
+            if not instance.personal_credential_id:
                 self._validate_perm(
                     instance.user,
                     instance.asset,
@@ -1322,6 +1333,8 @@ class SuperConnectionTokenViewSet(ConnectionTokenViewSet):
                 remote_addr=token.remote_addr,
                 org_id=token.org_id,
             )
+
+        ConnectionToken.objects.filter(pk=token.pk).update(date_last_used=timezone.now())
 
         return Response(serializer.data, status=status.HTTP_200_OK)
 

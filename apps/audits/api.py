@@ -319,6 +319,7 @@ class OperateLogViewSet(ReportExportMixin, OrgReadonlyModelViewSet):
 
 
 class PasswordChangeLogViewSet(ReportExportMixin, OrgReadonlyModelViewSet):
+    chat_ai_safe_sensitive_actions = ('list', 'retrieve')
     model = PasswordChangeLog
     serializer_class = PasswordChangeLogSerializer
     report_exporter_class = PasswordChangeLogReportExporter
@@ -339,6 +340,10 @@ class TicketAuditViewSet(OrgReadonlyModelViewSet):
     model = Ticket
     serializer_class = TicketSerializer
     filterset_class = TicketFilter
+    extra_filter_backends = [DatetimeRangeFilterBackend]
+    date_range_filter_fields = [
+        ('date_created', ('date_from', 'date_to'))
+    ]
     search_fields = ['title', 'type', 'status']
     ordering_fields = [
         'title', 'serial_num', 'type', 'state', 'status', 'applicant',

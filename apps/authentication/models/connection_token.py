@@ -6,6 +6,7 @@ from django.conf import settings
 from django.core.cache import cache
 from django.core.exceptions import ValidationError
 from django.db import models
+from django.db.models import Prefetch, prefetch_related_objects
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
 from django.utils.translation import gettext_lazy as _
@@ -63,6 +64,7 @@ class ConnectionToken(JMSOrgBaseModel):
     asset_display = models.CharField(max_length=128, default='', verbose_name=_("Asset display"))
     is_reusable = models.BooleanField(default=False, verbose_name=_("Reusable"))
     date_expired = models.DateTimeField(default=date_expired_default, verbose_name=_("Date expired"))
+    date_last_used = models.DateTimeField(null=True, blank=True, verbose_name=_("Date last used"))
     from_ticket = models.OneToOneField(
         'tickets.ApplyLoginAssetTicket', related_name='connection_token',
         on_delete=models.SET_NULL, null=True, blank=True,
@@ -182,12 +184,12 @@ class ConnectionToken(JMSOrgBaseModel):
     def expire_at(self):
         return self.permed_account.date_expired.timestamp()
 
-    def is_valid(self, include_personal_secret=False) -> bool:
+    def is_valid(self, include_personal_secret=False, *, check_expiration=True) -> bool:
         if not self.is_active:
             error = _('Connection token inactive')
             raise PermissionDenied(error)
 
-        if self.is_expired:
+        if check_expiration and self.is_expired:
             error = _('Connection token expired at: {}').format(as_current_tz(self.date_expired))
             raise PermissionDenied(error)
         if not self.user or not self.user.is_valid:
@@ -196,6 +198,11 @@ class ConnectionToken(JMSOrgBaseModel):
         if not self.asset or not self.asset.is_active:
             error = _('No asset or inactive asset')
             raise PermissionDenied(error)
+        from acls.models import ConnectMethodACL
+        if not ConnectMethodACL.is_method_allowed(
+            self.user, self.asset, self.connect_method, self.protocol
+        ):
+            raise PermissionDenied(_('Connect method is not allowed for this asset'))
         if self.protocol in ('http', 'https') and not settings.XPACK_LICENSE_IS_VALID:
             config = self.asset.spec_info or {}
             protocol = self.platform.protocols.filter(name=self.protocol).first()
@@ -207,10 +214,6 @@ class ConnectionToken(JMSOrgBaseModel):
             raise PermissionDenied(error)
 
         if self.personal_credential_id:
-            if self.account != AliasAccount.INPUT:
-                raise PermissionDenied(_(
-                    'Personal credentials can only be used with the manual account'
-                ))
             self.validate_personal_credential(
                 include_secret=include_personal_secret
             )
@@ -235,7 +238,7 @@ class ConnectionToken(JMSOrgBaseModel):
         )
 
         permission_context = get_personal_credential_permission_context(
-            self.user, self.asset, self.protocol
+            self.user, self.asset, self.protocol, account_alias=self.account,
         )
         # Reuse this account only on the request-local model instance. A token
         # loaded for a later request still performs the complete dynamic check.
@@ -272,7 +275,14 @@ class ConnectionToken(JMSOrgBaseModel):
             if cached is not None:
                 return cached
 
-        from accounts.personal_credentials import get_personal_credential_for_use
+        from accounts.personal_credentials import (
+            get_personal_credential_for_use,
+            get_personal_credential_permission_context,
+        )
+        if permission_context is None:
+            permission_context = get_personal_credential_permission_context(
+                self.user, self.asset, self.protocol, account_alias=self.account,
+            )
         try:
             credential = get_personal_credential_for_use(
                 self.user, self.asset, self.protocol, self.personal_credential_id,
@@ -417,7 +427,13 @@ class ConnectionToken(JMSOrgBaseModel):
             )
         else:
             account = self.get_asset_accounts_by_alias(self.asset, self.account)
-            if (
+            if self.personal_credential_id:
+                credential = self.get_personal_credential(include_secret=True)
+                if not account or account.secret or account.full_username != credential.username:
+                    raise PermissionDenied(_('Personal credential no longer matches the asset account'))
+                account.secret = credential.secret
+                account.secret_type = credential.secret_type
+            elif (
                 account.secret_type != SecretType.SSH_CERTIFICATE
                 and not account.secret and self.input_secret
             ):
@@ -444,7 +460,10 @@ class ConnectionToken(JMSOrgBaseModel):
 
     @lazyproperty
     def command_filter_acls(self):
+        from acls.const import ActionChoices as ACLActionChoices
         from acls.models import CommandFilterACL
+        from users.models import User
+
         kwargs = {
             'user': self.user,
             'asset': self.asset,
@@ -452,6 +471,16 @@ class ConnectionToken(JMSOrgBaseModel):
         }
         with tmp_to_org(self.asset.org_id):
             acls = CommandFilterACL.filter_queryset(**kwargs).valid()
+            # Bound M2M prefetch batches; only review actions need reviewers.
+            acls = list(acls.only(
+                'id', 'name', 'action', 'priority', 'is_active'
+            ).prefetch_related('command_groups').iterator(chunk_size=1000))
+            review_acls = [acl for acl in acls if acl.action == ACLActionChoices.review]
+            if review_acls:
+                prefetch_related_objects(
+                    review_acls,
+                    Prefetch('reviewers', queryset=User.objects.only('id', 'name')),
+                )
         return acls
 
     @lazyproperty
@@ -552,9 +581,10 @@ class AdminConnectionToken(ConnectionToken):
     def expire_at(self):
         return (timezone.now() + timezone.timedelta(days=365)).timestamp()
 
-    def is_valid(self, include_personal_secret=False):
+    def is_valid(self, include_personal_secret=False, *, check_expiration=True):
         return super().is_valid(
-            include_personal_secret=include_personal_secret
+            include_personal_secret=include_personal_secret,
+            check_expiration=check_expiration,
         )
 
     @classmethod

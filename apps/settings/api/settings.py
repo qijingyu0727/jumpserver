@@ -81,7 +81,7 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
 
     rbac_category_permissions = {
         'basic': 'settings.change_basic',
-        'tool': 'rbac.view_systemtools',
+        'tool': 'settings.change_systemtools',
         'terminal': 'settings.change_terminal',
         'luna': 'settings.change_terminal',
         'ops': 'settings.change_ops',
@@ -134,11 +134,11 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         return Setting.objects.all()
 
     def check_permissions(self, request):
-        ok = RoleBinding.is_org_admin(request.user)
         category = request.query_params.get('category', 'basic')
         perm_required = self.rbac_category_permissions.get(category)
 
-        if ok and perm_required == 'settings.view_setting':
+        if perm_required == 'settings.view_setting' and \
+                RoleBinding.is_org_admin(request.user):
             return True
 
         has = request.user.has_perm(perm_required)
@@ -157,9 +157,11 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         return fields
 
     def get_object(self):
-        items = self.get_fields().keys()
+        fields = self.get_fields()
         obj = {}
-        for item in items:
+        for item, field in fields.items():
+            if field.source == '*':
+                continue
             if hasattr(settings, item):
                 obj[item] = getattr(settings, item)
             else:
@@ -220,19 +222,28 @@ class SettingsApi(generics.RetrieveUpdateAPIView):
         data = serializer.validated_data
 
         def target_value(name):
-            return data.get(name) or getattr(settings, name, None)
+            value = data.get(name)
+            if value in ('', None):
+                return getattr(settings, name, None)
+            return value
 
         source = OpenBaoKVClient(
             addr=settings.VAULT_OPENBAO_ADDR,
             token=settings.VAULT_OPENBAO_TOKEN,
             mount_point=old_mount_point,
             timeout=settings.VAULT_OPENBAO_TIMEOUT,
+            verify_tls=settings.VAULT_OPENBAO_VERIFY_TLS,
+            ca_cert=settings.VAULT_OPENBAO_CACERT_CONTENT,
+            ca_cert_file=settings.VAULT_OPENBAO_CACERT_FILE,
         )
         target = OpenBaoKVClient(
             addr=target_value('VAULT_OPENBAO_ADDR'),
             token=target_value('VAULT_OPENBAO_TOKEN'),
             mount_point=new_mount_point,
             timeout=target_value('VAULT_OPENBAO_TIMEOUT'),
+            verify_tls=target_value('VAULT_OPENBAO_VERIFY_TLS'),
+            ca_cert=target_value('VAULT_OPENBAO_CACERT_CONTENT'),
+            ca_cert_file=settings.VAULT_OPENBAO_CACERT_FILE,
         )
 
         ok, error = target.is_active()
